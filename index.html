@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>PC 音频接收端</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; padding: 18px 16px 34px; background: #0e1116; color: #e8edf4;
+    font: 16px/1.5 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  h1 { font-size: 19px; margin: 4px 0 16px; font-weight: 600; }
+  h1 .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+            background: #f0ad4e; margin-right: 8px; vertical-align: 1px; }
+  h1 .dot.ok { background: #31c48d; }
+  h1 .dot.bad { background: #e5534b; }
+  #start {
+    width: 100%; padding: 20px; font-size: 19px; font-weight: 600; border-radius: 14px;
+    border: 0; background: #2f6fed; color: #fff; margin-bottom: 18px;
+  }
+  #start:disabled { background: #1f3d78; color: #9fb6df; }
+  .card { background: #161b22; border: 1px solid #232a34; border-radius: 14px;
+          padding: 14px 15px; margin-bottom: 14px; }
+  .row { display: flex; align-items: center; gap: 12px; margin: 10px 0; }
+  .row label { flex: 0 0 92px; font-size: 14px; color: #9aa7b8; }
+  .row input[type=range] { flex: 1; accent-color: #2f6fed; }
+  .row .val { flex: 0 0 74px; text-align: right; font-size: 14px;
+              font-variant-numeric: tabular-nums; }
+  .presets { display: flex; gap: 8px; margin: 6px 0 2px; }
+  .presets button { flex: 1; padding: 11px 0; font-size: 14px; border-radius: 10px;
+                    border: 1px solid #2b3542; background: #1b2230; color: #cfd8e3; }
+  .presets button.on { background: #2f6fed; border-color: #2f6fed; color: #fff; }
+  #stats { font-size: 14px; color: #c7d2e0; font-variant-numeric: tabular-nums; }
+  #stats b { color: #fff; font-weight: 600; }
+  #est { font-size: 13px; color: #8d9bb0; margin-top: 8px; }
+  #log { font-size: 13px; color: #8d9bb0; }
+  #hint { font-size: 13px; color: #f0ad4e; margin-top: 8px; min-height: 20px; }
+  ul { margin: 8px 0 0; padding-left: 18px; font-size: 13px; color: #93a1b5; }
+  li { margin: 4px 0; }
+  b.k { color: #cfd8e3; }
+</style>
+</head>
+<body>
+  <h1><span class="dot" id="dot"></span>PC 音频接收端</h1>
+
+  <button id="start">开始播放</button>
+
+  <div class="card">
+    <div class="row">
+      <label>目标缓冲</label>
+      <input id="buf" type="range" min="10" max="200" step="5" value="30">
+      <span class="val" id="bufval">30 ms</span>
+    </div>
+    <div class="presets">
+      <button data-buf="15">极限 15ms</button>
+      <button data-buf="30" class="on">均衡 30ms</button>
+      <button data-buf="60">稳定 60ms</button>
+    </div>
+    <div class="row">
+      <label>音量</label>
+      <input id="vol" type="range" min="0" max="100" step="1" value="80">
+      <span class="val" id="volval">80%</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div id="stats">等待开始…</div>
+    <div id="est"></div>
+    <div id="log"></div>
+    <div id="hint"></div>
+  </div>
+
+  <div class="card">
+    <div style="font-size:14px;color:#9aa7b8">把延迟压到最低</div>
+    <ul>
+      <li>手机开 <b class="k">USB 网络共享</b> 给电脑，抖动比 WiFi 低得多，缓冲可以压到 15ms</li>
+      <li>手机不要连蓝牙耳机或蓝牙音箱（蓝牙自身就会加 150ms 以上）</li>
+      <li>用 Chrome；页面保持在<b class="k">前台</b>，关掉省电模式</li>
+      <li>手机别让它自动锁屏：页面切到后台或息屏后，浏览器可能暂停播放</li>
+      <li>出现断续或爆音，就把目标缓冲加 10–20ms，直到稳定</li>
+      <li>看视频时声音会晚于画面，大约等于本页的估算值；在播放器里把音频延迟调到 −100ms 左右即可对齐</li>
+    </ul>
+  </div>
+
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var btnStart = $('start'), elBuf = $('buf'), elVol = $('vol');
+  var elStats = $('stats'), elEst = $('est'), elLog = $('log'), elHint = $('hint'), elDot = $('dot');
+
+  var ctx = null, gain = null, ws = null, running = false, screenLock = null;
+  var rate = 48000, channels = 2;
+  var nextTime = 0, targetMs = 30;
+  var rtt = 0, outLatency = 0, bytesWindow = 0, kbps = 0;
+  var lastTick = 0;
+  var S = { recv: 0, dropped: 0, underrun: 0, reset: 0, corr: 0 };
+  var SCALE = 1 / 32768;
+
+  function log(msg) { elLog.textContent = msg || ''; }
+
+  function connect() {
+    if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;
+    var proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    try { ws = new WebSocket(proto + '://' + location.host + '/ws'); }
+    catch (e) { setTimeout(connect, 1000); return; }
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = function () { elDot.className = 'dot ok'; log('已连接'); };
+    ws.onerror = function () { elDot.className = 'dot bad'; };
+    ws.onclose = function () {
+      elDot.className = 'dot bad';
+      log('连接断开，正在重连…');
+      nextTime = 0;
+      setTimeout(connect, 700);
+    };
+    ws.onmessage = onMessage;
+  }
+
+  function onMessage(ev) {
+    if (typeof ev.data === 'string') {
+      var d;
+      try { d = JSON.parse(ev.data); } catch (e) { return; }
+      if (d.type === 'config') {
+        rate = d.rate; channels = d.channels;
+        if (ctx && Math.abs(ctx.sampleRate - rate) > 1) {
+          elHint.textContent = '采样率与设备不一致，可能多一层重采样';
+        }
+      } else if (d.t === 'pong') {
+        rtt = performance.now() - d.ts;
+      }
+      return;
+    }
+    if (!running || !ctx) return;
+    var ab = ev.data;
+    if (ab.byteLength < 8 || ab.byteLength % (2 * channels) !== 0) return;
+    var i16 = new Int16Array(ab);
+    var frames = i16.length / channels;
+    var buffer = ctx.createBuffer(channels, frames, rate);
+    var c0 = buffer.getChannelData(0);
+    var c1, i, j;
+    if (channels >= 2) {
+      c1 = buffer.getChannelData(1);
+      for (i = 0, j = 0; i < frames; i++, j += 2) {
+        c0[i] = i16[j] * SCALE;
+        c1[i] = i16[j + 1] * SCALE;
+      }
+    } else {
+      for (i = 0; i < frames; i++) { c0[i] = i16[i] * SCALE; }
+    }
+    bytesWindow += ab.byteLength;
+    S.recv++;
+    schedule(buffer);
+  }
+
+  function schedule(buffer) {
+    var now = ctx.currentTime;
+    var target = targetMs / 1000;
+    if (nextTime === 0 || nextTime < now + 0.003) {
+      if (nextTime !== 0) { S.underrun++; }
+      nextTime = now + target;
+    }
+    var ahead = nextTime - now;
+    if (ahead > target + 0.25) {
+      S.reset++;
+      nextTime = now + target;
+      ahead = target;
+    }
+    var err = ahead - target;
+    var pr = 1;
+    if (err > 0.004) { pr = 1 + Math.min(0.06, err * 4); }
+    else if (err < -0.004) { pr = 1 - Math.min(0.06, -err * 4); }
+    var src = ctx.createBufferSource();
+    src.buffer = buffer;
+    if (pr !== 1) { src.playbackRate.value = pr; S.corr++; }
+    src.connect(gain);
+    src.start(nextTime);
+    nextTime += buffer.duration / pr;
+  }
+
+  function requestWakeLock() {
+    try {
+      if (navigator.wakeLock && !screenLock) {
+        navigator.wakeLock.request('screen').then(function (l) {
+          screenLock = l;
+          l.addEventListener('release', function () { screenLock = null; });
+        }).catch(function () {});
+      }
+    } catch (e) {}
+  }
+
+  btnStart.onclick = function () {
+    if (running) { return; }
+    btnStart.disabled = true;
+    var AC = window.AudioContext || window.webkitAudioContext;
+    try { ctx = new AC({ sampleRate: rate, latencyHint: 'interactive' }); }
+    catch (e) { ctx = new AC(); }
+    var boot = function () {
+      gain = ctx.createGain();
+      gain.gain.value = elVol.value / 100;
+      gain.connect(ctx.destination);
+      nextTime = 0;
+      running = true;
+      btnStart.textContent = '播放中';
+      elHint.textContent = '';
+      requestWakeLock();
+      connect();
+      tick();
+    };
+    if (ctx.state === 'suspended') {
+      var p = ctx.resume();
+      if (p && p.then) { p.then(boot); } else { boot(); }
+    } else {
+      boot();
+    }
+  };
+
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) { requestWakeLock(); }
+  });
+
+  elBuf.oninput = function () {
+    targetMs = parseInt(elBuf.value, 10);
+    $('bufval').textContent = targetMs + ' ms';
+    var list = document.querySelectorAll('.presets button');
+    for (var i = 0; i < list.length; i++) {
+      list[i].className = (parseInt(list[i].dataset.buf, 10) === targetMs) ? 'on' : '';
+    }
+  };
+
+  elVol.oninput = function () {
+    $('volval').textContent = elVol.value + '%';
+    if (gain) { gain.gain.value = elVol.value / 100; }
+  };
+
+  var presetBtns = document.querySelectorAll('.presets button');
+  for (var bi = 0; bi < presetBtns.length; bi++) {
+    presetBtns[bi].onclick = function () {
+      elBuf.value = this.dataset.buf;
+      elBuf.oninput();
+      nextTime = 0;
+    };
+  }
+
+  setInterval(function () {
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ t: 'ping', ts: performance.now() }));
+    }
+  }, 1000);
+
+  function tick() {
+    if (!running) { return; }
+    var nowMs = performance.now();
+    var elapsed = lastTick ? (nowMs - lastTick) / 1000 : 0;
+    lastTick = nowMs;
+    var aheadMs = nextTime ? Math.max(0, nextTime - ctx.currentTime) * 1000 : 0;
+    if (ctx.outputLatency !== undefined) { outLatency = ctx.outputLatency; }
+    else if (ctx.baseLatency !== undefined) { outLatency = ctx.baseLatency; }
+    if (elapsed > 0) {
+      kbps = kbps * 0.5 + (bytesWindow * 8 / 1000 / elapsed) * 0.5;
+    }
+    bytesWindow = 0;
+    var estimate = 12 + rtt / 2 + aheadMs + outLatency * 1000;
+    elStats.innerHTML =
+      '缓冲 <b>' + aheadMs.toFixed(0) + ' ms</b> · 丢块 <b>' + S.dropped + '</b>' +
+      ' · 欠载 <b>' + S.underrun + '</b> · 修正 <b>' + S.corr + '</b><br>' +
+      '网络 RTT <b>' + rtt.toFixed(0) + ' ms</b>' +
+      ' · 码率 <b>' + kbps.toFixed(0) + ' kbps</b>' +
+      ' · 收包 <b>' + S.recv + '</b>';
+    elEst.textContent = '估算端到端 ≈ ' + estimate.toFixed(0) +
+      ' ms（含采集约 10ms、手机输出缓冲 ' + (outLatency * 1000).toFixed(0) + 'ms）';
+    if (aheadMs > targetMs + 12) {
+      elHint.textContent = '网络抖动偏大；若经常爆音就把目标缓冲再调大一点';
+    } else if (S.underrun > 0 && S.recv > 30) {
+      elHint.textContent = '出现过断流（欠载 ' + S.underrun + ' 次），建议加大缓冲';
+    } else if (aheadMs < targetMs * 0.5 && S.recv > 30) {
+      elHint.textContent = '当前缓冲低于目标，说明还有下调空间';
+    } else {
+      elHint.textContent = '';
+    }
+    setTimeout(tick, 300);
+  }
+
+  connect();
+})();
+</script>
+</body>
+</html>
